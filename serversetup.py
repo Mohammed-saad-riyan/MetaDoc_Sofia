@@ -1,3 +1,4 @@
+import json
 from flask import Flask, request, jsonify
 import os
 import whisper
@@ -6,257 +7,237 @@ import re
 import tempfile
 import subprocess
 import time
-import json
-import datetime
+import glob  # Add this import for file pattern matching
 from gtts import gTTS
 from threading import Timer
-from hassan2 import generate_keyframes_from_audio
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from datetime import datetime, timedelta
-from dateutil import parser
+import datetime
+from phoneme_generator import process_audio_to_phonemes
 
 app = Flask(__name__)
 UPLOAD_DIR = 'uploads'
 OUTPUT_DIR = 'output'
-REMINDERS_FILE = "reminders.json"
-APPOINTMENTS_FILE = "appointments.json"
+REMINDERS_FILE = 'reminders.json'
+PATIENT_HISTORY_FILE = 'patient_history.json'
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Initialize Whisper model
+# Initialize patient history if it doesn't exist
+if not os.path.exists(PATIENT_HISTORY_FILE):
+    # Create a basic structure for the patient history file
+    default_patient_history = {
+        "patient_name": "Saad",
+        "age": 45,
+        "medical_history": {
+            "procedures": [
+                {
+                    "type": "heart surgery",
+                    "date": "2025-05-01",
+                    "doctor": "Dr. Reddys",
+                    "details": "Coronary artery bypass grafting (CABG)"
+                }
+            ],
+            "conditions": [
+                "Coronary artery disease",
+                "Mild hypertension",
+                "Type 2 diabetes (controlled)"
+            ]
+        },
+        "medications": [
+            {
+                "name": "Aspirin",
+                "dosage": "81mg",
+                "frequency": "once daily",
+                "purpose": "Blood thinner",
+                "schedule": "morning with breakfast"
+            },
+            {
+                "name": "Metoprolol",
+                "dosage": "25mg",
+                "frequency": "twice daily",
+                "purpose": "Beta blocker for heart",
+                "schedule": "morning and evening"
+            },
+            {
+                "name": "Lipitor",
+                "dosage": "20mg",
+                "frequency": "once daily",
+                "purpose": "Cholesterol management",
+                "schedule": "evening before bed"
+            },
+            {
+                "name": "Metformin",
+                "dosage": "500mg",
+                "frequency": "twice daily",
+                "purpose": "Diabetes management",
+                "schedule": "with morning and evening meals"
+            }
+        ],
+        "allergies": ["Penicillin"],
+        "last_checkup": "2024-05-10",
+        "next_appointment": "2025-06-10"
+    }
+    
+    with open(PATIENT_HISTORY_FILE, 'w') as f:
+        json.dump(default_patient_history, f, indent=2)
+    print(f"[INFO] Created default patient history file: {PATIENT_HISTORY_FILE}")
+
+# Initialize reminders file if it doesn't exist
+if not os.path.exists(REMINDERS_FILE):
+    with open(REMINDERS_FILE, 'w') as f:
+        json.dump([], f)
+    print(f"[INFO] Created empty reminders file: {REMINDERS_FILE}")
+
+# Add cleanup function for JSON files
+def cleanup_json_files():
+    try:
+        # Get all JSON files in the output directory
+        json_files = glob.glob(os.path.join(OUTPUT_DIR, "*.json"))
+        for file in json_files:
+            try:
+                os.remove(file)
+                print(f"[CLEANUP] Deleted: {file}")
+            except Exception as e:
+                print(f"[CLEANUP] Error deleting {file}: {e}")
+        print(f"[CLEANUP] Removed {len(json_files)} JSON files from {OUTPUT_DIR}")
+    except Exception as e:
+        print(f"[CLEANUP] Error during cleanup: {e}")
+
+# Call cleanup function when server starts
+cleanup_json_files()
+
 model = whisper.load_model("tiny.en")
 AUDIO_OUTPUT_FILE = os.path.join(OUTPUT_DIR, "response.wav")
-KEYFRAMES_OUTPUT_FILE = os.path.join(OUTPUT_DIR, "response_keyframes.json")
 
-# Global variables
+# Global variables to track animation state
 animation_active = False
 animation_start_time = 0
 current_audio_duration = 0
+current_keyframes_path = None
 
-# System prompt for the medical assistant
-SYSTEM_PROMPT = """You are Dr. Sophia (Smart Optimized Physician Health Intelligence Assistant), 
-a metahuman doctor providing comprehensive healthcare support through advanced AI capabilities.
+def get_patient_history():
+    """Load the patient history data"""
+    try:
+        with open(PATIENT_HISTORY_FILE, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[ERROR] Failed to load patient history: {e}")
+        return {}
 
-Key Capabilities:
-1. Schedule and manage medical appointments
-2. Set medication reminders and health-related alerts
-3. Provide basic medical information and guidance
-4. Assist with healthcare scheduling and organization
+SYSTEM_PROMPT = """
+You are Dr. Sophia, a warm and friendly metahuman doctor providing quick and accurate medical support using advanced AI.
 
-IMPORTANT GUIDELINES:
-- Keep responses professional, clear, and concise
-- Focus on healthcare-related inquiries
-- Maintain patient privacy and confidentiality
-- NEVER create or mention fictional appointments or reminders
-- Only reference actual appointments and reminders from the system database
-- Use specific command tags for data operations:
-  * <VIEW_REMINDERS> - To view existing reminders
-  * <SET_REMINDER> - To set a new reminder
-  * <VIEW_APPOINTMENTS> - To view actual scheduled appointments
-  * <SCHEDULE_APPOINTMENT> - To schedule a new appointment
-
-Remember: 
-- You are Dr. Sophia, combining medical expertise with a compassionate approach
-- Only discuss appointments and reminders that actually exist in the system
-- If asked about specific appointments or reminders, always verify with the database first
-- Never make assumptions about existing appointments or reminders
+Guidelines:
+- Always answer in 1-2 sentences, clear and medically accurate.
+- Keep the tone friendly, casual, and comforting.
+- Never sound too formal or robotic.
+- If the issue sounds critical, urgent, or life-threatening, kindly say: 
+  'That sounds serious, please book an appointment with a doctor as soon as possible.'
+- You have access to Saad's medical history who recently had heart surgery. If asked about medications, history, or treatment, refer to this information.
+- If asked to set a reminder, acknowledge that you've set it and briefly mention what it's for.
+- When asked about existing reminders, ONLY reference actual reminders from the reminders.json file. Never create fictional reminders or make up reminder information that doesn't exist in the file.
+- If there are no reminders when asked, simply state "You don't have any reminders set up at the moment."
 """
 
-def load_json_data(filename, default=None):
-    """Load data from a JSON file"""
-    if default is None:
-        default = []
-    try:
-        if os.path.exists(filename):
-            with open(filename, 'r') as f:
-                return json.load(f)
-        else:
-            with open(filename, 'w') as f:
-                json.dump(default, f)
-            return default
-    except Exception as e:
-        print(f"Error loading {filename}: {str(e)}")
-        return default
+def parse_reminder(transcript):
+    """
+    Parse a transcript to extract reminder details
+    Returns: (is_reminder, reminder_text, reminder_time) or (False, None, None) if not a reminder
+    """
+    # Common reminder request patterns
+    reminder_patterns = [
+        r"(?:set|create|add|make)(?:\s+a)?\s+reminder(?:\s+for)?\s+(.+?)(?:\s+(?:at|on|for)\s+(.+?))?(?:\.|\?|$)",
+        r"remind\s+(?:me\s+)?(?:to\s+)?(.+?)(?:\s+(?:at|on|for)\s+(.+?))?(?:\.|\?|$)",
+        r"don't\s+(?:let\s+me\s+)?forget\s+(?:to\s+)?(.+?)(?:\s+(?:at|on|for)\s+(.+?))?(?:\.|\?|$)"
+    ]
+    
+    # Check each pattern
+    for pattern in reminder_patterns:
+        match = re.search(pattern, transcript, re.IGNORECASE)
+        if match:
+            reminder_text = match.group(1).strip()
+            reminder_time = match.group(2).strip() if match.group(2) else "today"
+            return True, reminder_text, reminder_time
+    
+    return False, None, None
 
-def save_json_data(filename, data):
-    """Save data to a JSON file"""
-    try:
-        with open(filename, 'w') as f:
-            json.dump(data, f, indent=2)
-        return True
-    except Exception as e:
-        print(f"Error saving to {filename}: {str(e)}")
-        return False
+def is_asking_about_reminders(transcript):
+    """Check if the user is asking about existing reminders"""
+    reminder_query_patterns = [
+        r"(?:what|show|tell|list)(?:\s+are)?\s+(?:my|the)\s+reminders",
+        r"(?:show|list|tell\s+me)(?:\s+my|the)\s+reminders",
+        r"(?:do\s+i\s+have)(?:\s+any)?\s+reminders",
+        r"(?:remind\s+me\s+of)(?:\s+my)?\s+reminders",
+        r"what\s+do\s+i\s+need\s+to\s+remember"
+    ]
+    
+    for pattern in reminder_query_patterns:
+        if re.search(pattern, transcript, re.IGNORECASE):
+            return True
+    
+    return False
 
-def extract_date_time(text):
-    """Extract date and time from text"""
+def get_all_reminders():
+    """Load and return all reminders from the reminders file"""
     try:
-        now = datetime.now()
-        
-        if "tomorrow" in text.lower():
-            return now + timedelta(days=1)
-        elif "day after tomorrow" in text.lower():
-            return now + timedelta(days=2)
-        elif "next week" in text.lower():
-            return now + timedelta(weeks=1)
-        
-        return parser.parse(text, fuzzy=True)
+        with open(REMINDERS_FILE, 'r') as f:
+            reminders = json.load(f)
+        return reminders
     except Exception as e:
-        print(f"Error extracting date/time: {str(e)}")
-        return now
+        print(f"[ERROR] Failed to load reminders: {e}")
+        return []
 
-def set_reminder(text):
-    """Set a reminder"""
+def format_reminders_response(reminders):
+    """Format reminders into a nice response"""
+    if not reminders:
+        return "You don't have any reminders set up at the moment."
+    
+    if len(reminders) == 1:
+        reminder = reminders[0]
+        return f"You have one reminder: to {reminder['text']} at {reminder['time']}."
+    
+    # Multiple reminders
+    reminder_texts = []
+    for i, reminder in enumerate(reminders):
+        reminder_texts.append(f"{i+1}) to {reminder['text']} at {reminder['time']}")
+    
+    return f"You have {len(reminders)} reminders: {'. '.join(reminder_texts)}"
+
+def save_reminder(reminder_text, reminder_time):
+    """Save a reminder to the reminders file"""
     try:
-        reminder_text = text.lower()
-        reminder_for = re.search(r'remind (?:me|the patient|us) (?:to|about) (.*?)(?:at|on|in|$)', reminder_text)
-        if not reminder_for:
-            reminder_for = re.search(r'set (?:a|an) reminder (?:to|for|about) (.*?)(?:at|on|in|$)', reminder_text)
-            
-        reminder_subject = reminder_for.group(1).strip() if reminder_for else "General reminder"
-        reminder_time = extract_date_time(reminder_text)
+        # Load existing reminders
+        with open(REMINDERS_FILE, 'r') as f:
+            reminders = json.load(f)
         
-        reminders = load_json_data(REMINDERS_FILE, [])
-        new_reminder = {
+        # Add new reminder
+        reminder = {
             "id": len(reminders) + 1,
-            "subject": reminder_subject,
-            "time": reminder_time.strftime("%Y-%m-%d %H:%M"),
-            "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "text": reminder_text,
+            "time": reminder_time,
+            "created_at": datetime.datetime.now().isoformat(),
             "completed": False
         }
+        reminders.append(reminder)
         
-        reminders.append(new_reminder)
-        save_json_data(REMINDERS_FILE, reminders)
-        
-        return f"Reminder set for {reminder_subject} at {reminder_time.strftime('%Y-%m-%d %H:%M')}"
-    except Exception as e:
-        print(f"Error setting reminder: {str(e)}")
-        return "I couldn't set that reminder. Please try again with a specific time and subject."
-
-def schedule_appointment(text):
-    """Schedule an appointment"""
-    try:
-        appointment_text = text.lower()
-        appointment_type_match = re.search(r'(appointment|visit|consultation|checkup|follow-up) (?:with|for) (.*?)(?:on|at|in|$)', appointment_text)
-        
-        appointment_type = appointment_type_match.group(1).strip() if appointment_type_match else "General appointment"
-        doctor_or_dept = appointment_type_match.group(2).strip() if appointment_type_match else "Doctor MEDICAL"
-        
-        appointment_time = extract_date_time(appointment_text)
-        
-        appointments = load_json_data(APPOINTMENTS_FILE, [])
-        new_appointment = {
-            "id": len(appointments) + 1,
-            "type": appointment_type,
-            "with": doctor_or_dept,
-            "time": appointment_time.strftime("%Y-%m-%d %H:%M"),
-            "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "notes": ""
-        }
-        
-        appointments.append(new_appointment)
-        save_json_data(APPOINTMENTS_FILE, appointments)
-        
-        return f"Appointment scheduled: {appointment_type} with {doctor_or_dept} on {appointment_time.strftime('%Y-%m-%d at %H:%M')}"
-    except Exception as e:
-        print(f"Error scheduling appointment: {str(e)}")
-        return "I couldn't schedule that appointment. Please try again with a specific time and doctor."
-
-def view_reminders():
-    """View active reminders - Only returns actual reminders from database"""
-    try:
-        reminders = load_json_data(REMINDERS_FILE, [])
-        active_reminders = [r for r in reminders if not r.get('completed', False)]
-        
-        if not active_reminders:
-            return "You currently have no active reminders in the system."
+        # Save updated reminders
+        with open(REMINDERS_FILE, 'w') as f:
+            json.dump(reminders, f, indent=2)
             
-        result = "Here are your confirmed reminders from the system:\n"
-        for i, reminder in enumerate(active_reminders, 1):
-            time_str = reminder['time'].split()[1] if ' ' in reminder['time'] else reminder['time']
-            date_str = reminder['time'].split()[0] if ' ' in reminder['time'] else "today"
-            result += f"{i}. {reminder['subject']} at {time_str} on {date_str}\n"
-            
-        return result.strip()
+        print(f"[INFO] Saved reminder: '{reminder_text}' for {reminder_time}")
+        return True
     except Exception as e:
-        print(f"Error viewing reminders: {str(e)}")
-        return "I couldn't access the reminders database at this time."
-
-def view_appointments():
-    """View upcoming appointments - Only returns actual appointments from database"""
-    try:
-        appointments = load_json_data(APPOINTMENTS_FILE, [])
-        now = datetime.now()
-        upcoming = []
-        
-        for apt in appointments:
-            apt_time = datetime.strptime(apt['time'], "%Y-%m-%d %H:%M")
-            if apt_time > now:
-                upcoming.append(apt)
-                
-        if not upcoming:
-            return "You currently have no appointments scheduled in the system."
-            
-        result = "Here are your confirmed appointments from the system:\n"
-        for i, apt in enumerate(upcoming, 1):
-            result += f"{i}. {apt['type']} with {apt['with']} on {apt['time']}\n"
-            
-        return result.strip()
-    except Exception as e:
-        print(f"Error viewing appointments: {str(e)}")
-        return "I couldn't access the appointments database at this time."
-
-def generate_medical_response(text):
-    """Generate response using Ollama with deepseek model"""
-    try:
-        # Check if the query is about appointments or reminders
-        query_lower = text.lower()
-        if any(word in query_lower for word in ['appointment', 'scheduled', 'booked', 'meeting']):
-            # First check actual appointments
-            appointments = load_json_data(APPOINTMENTS_FILE, [])
-            if not appointments and 'view' in query_lower:
-                return "I don't see any appointments currently scheduled in the system. Would you like to schedule one?"
-                
-        if any(word in query_lower for word in ['reminder', 'remind', 'alert']):
-            # First check actual reminders
-            reminders = load_json_data(REMINDERS_FILE, [])
-            if not reminders and 'view' in query_lower:
-                return "I don't see any active reminders in the system. Would you like to set one?"
-
-        # Generate response using Ollama
-        response = ollama.chat(
-            model="deepseek-r1:1.5b",
-            messages=[{"role": "user", "content": text}]
-        )
-        
-        if response and "message" in response and "content" in response["message"]:
-            raw_content = response["message"]["content"]
-            response_text = clean_llm_output(raw_content)
-        else:
-            return "I apologize, but I'm having trouble generating a response at the moment."
-        
-        # Process commands in the response
-        if "view reminders" in response_text.lower():
-            return view_reminders()
-        elif "view appointments" in response_text.lower():
-            return view_appointments()
-        elif "set reminder" in response_text.lower():
-            return set_reminder(text)
-        elif "schedule appointment" in response_text.lower():
-            return schedule_appointment(text)
-            
-        return response_text
-    except Exception as e:
-        print(f"Error generating response: {str(e)}")
-        return "I apologize, but I'm having trouble accessing the system at the moment. Please try again."
+        print(f"[ERROR] Failed to save reminder: {e}")
+        return False
 
 def clean_llm_output(raw: str) -> str:
     return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
 
 def estimate_audio_duration(text):
+   
     words = len(text.split())
     estimated_seconds = words / 2.5
+    # Add a little buffer
     return max(estimated_seconds + 0.5, 1.0)
 
 def reset_animation_after_delay(delay_seconds):
@@ -267,18 +248,21 @@ def reset_animation_after_delay(delay_seconds):
         animation_active = False
         print(f"[INFO] Animation automatically deactivated after {delay_seconds:.2f} seconds")
     
+    # Schedule the reset
     timer = Timer(delay_seconds, reset)
-    timer.daemon = True
+    timer.daemon = True  # So the timer doesn't prevent app shutdown
     timer.start()
 
 def text_to_speech_and_save(text, output_audio_path=AUDIO_OUTPUT_FILE):
-    global current_audio_duration
+    global current_audio_duration, current_keyframes_path
     
     try:
+        # Estimate duration before generating audio
         current_audio_duration = estimate_audio_duration(text)
         print(f"[INFO] Estimated audio duration: {current_audio_duration:.2f} seconds")
         
-        tts = gTTS(text=text, lang='en', tld='com', slow=False)
+        tts = gTTS(text=text, lang='en', tld='com.au', slow=False)
+
         temp_mp3_path = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
         tts.save(temp_mp3_path)
 
@@ -299,110 +283,162 @@ def text_to_speech_and_save(text, output_audio_path=AUDIO_OUTPUT_FILE):
             sound.export(output_audio_path, format="wav")
 
         os.remove(temp_mp3_path)
+        
+        # Generate phonemes after creating the audio file
+        print("[INFO] Generating phoneme keyframes...")
+        current_keyframes_path = process_audio_to_phonemes(output_audio_path, OUTPUT_DIR)
+        if current_keyframes_path:
+            print(f"[INFO] Generated keyframes at: {current_keyframes_path}")
+        else:
+            print("[WARNING] Failed to generate phoneme keyframes")
+            
         return output_audio_path
     except Exception as e:
         print(f"[ERROR] TTS generation failed: {e}")
         current_audio_duration = 0
+        current_keyframes_path = None
         return None
 
-def process_audio_response():
-    """Generate keyframes from the response audio"""
+def generate_response(transcript):
     try:
-        if not os.path.exists(AUDIO_OUTPUT_FILE):
-            print("[ERROR] Response audio file not found")
-            return None
+        prompt = transcript.strip()
+        if not prompt:
+            return "I'm sorry, I didn't catch that. Could you please repeat?"
+
+        # Check if this is a request to list existing reminders
+        if is_asking_about_reminders(prompt):
+            reminders = get_all_reminders()
+            return format_reminders_response(reminders)
             
-        print("[INFO] Generating keyframes from response audio")
-        keyframes_file = generate_keyframes_from_audio(AUDIO_OUTPUT_FILE, KEYFRAMES_OUTPUT_FILE)
+        # Check if this is a reminder request
+        is_reminder, reminder_text, reminder_time = parse_reminder(prompt)
+        if is_reminder and reminder_text:
+            # Save the reminder
+            if save_reminder(reminder_text, reminder_time):
+                return f"I've set a reminder for you to {reminder_text} at {reminder_time}."
         
-        if keyframes_file and os.path.exists(keyframes_file):
-            print(f"[INFO] Successfully generated keyframes: {keyframes_file}")
-            return keyframes_file
+        # Load patient history to provide context
+        patient_history = get_patient_history()
+        
+        # Add patient context to the system prompt
+        context_prompt = SYSTEM_PROMPT
+        if patient_history:
+            medications = patient_history.get("medications", [])
+            med_list = ", ".join([f"{m['name']} ({m['dosage']}, {m['frequency']}, {m['purpose']})" for m in medications[:3]])
+            history = ", ".join(patient_history.get("medical_history", {}).get("conditions", [])[:3])
+            
+            additional_context = f"""
+Additional patient context:
+- Patient name: {patient_history.get('patient_name', 'Saad')}
+- Recent procedures: {patient_history.get('medical_history', {}).get('procedures', [{}])[0].get('type', 'heart surgery')} on {patient_history.get('medical_history', {}).get('procedures', [{}])[0].get('date', 'N/A')} with {patient_history.get('medical_history', {}).get('procedures', [{}])[0].get('doctor', 'N/A')}
+- Key conditions: {history}
+- Current medications: {med_list}
+- Next appointment: {patient_history.get('next_appointment', 'N/A')}
+
+Current reminders:
+{format_reminders_response(get_all_reminders())}
+"""
+            context_prompt += additional_context
+
+        print(f"[INFO] Sending prompt to Ollama: {prompt[:50]}...")
+        response = ollama.chat(
+            model="deepseek-r1:1.5b",
+            messages=[
+                {"role": "system", "content": context_prompt},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        if response and "message" in response and "content" in response["message"]:
+            raw_content = response["message"]["content"]
+            return clean_llm_output(raw_content)
         else:
-            print("[ERROR] Failed to generate keyframes")
-            return None
+            print("[ERROR] Unexpected response format from Ollama")
+            return "Sorry, I couldn't generate a response."
     except Exception as e:
-        print(f"[ERROR] Error processing audio response: {e}")
-        return None
+        print(f"[ERROR] Error generating LLM response: {e}")
+        return f"Error generating response: {str(e)}"
 
 @app.route('/', methods=['POST'])
 def transcribe_trail():
-    global animation_active, animation_start_time
+    global animation_active, animation_start_time, current_keyframes_path
     print("[INFO] Incoming request")
     audio_file_path = os.path.join(UPLOAD_DIR, 'trail.wav')
     transcript = None
-    response_text = None
-    keyframes_file = None
+    llm_response = None
 
     if os.path.exists(audio_file_path):
         print(f"[SCAN] Found audio file: {audio_file_path}")
         try:
-            # Step 1: Transcribe input audio
             result = model.transcribe(audio_file_path)
             transcript = result["text"].strip()
             print(f"[TRANSCRIPT] {transcript}")
 
-            # Step 2: Generate response
-            response_text = generate_medical_response(transcript)
-            print(f"[MEDICAL] Response: {response_text}")
+            llm_response = generate_response(transcript)
+            print(f"[LLM] Response: {llm_response}")
 
-            # Step 3: Convert response to speech
-            audio_path = text_to_speech_and_save(response_text, AUDIO_OUTPUT_FILE)
-            if not audio_path:
-                raise Exception("Failed to generate speech audio")
+            text_to_speech_and_save(llm_response, AUDIO_OUTPUT_FILE)
             
-            # Step 4: Generate keyframes from response audio
-            keyframes_file = process_audio_response()
-            if not keyframes_file:
-                raise Exception("Failed to generate keyframes")
-            
-            # Step 5: Only activate animation after everything is ready
-            print(f"[INFO] All assets generated, activating animation for {current_audio_duration:.2f} seconds")
+            # Set animation to active when we have a response
             animation_active = True
             animation_start_time = time.time()
+            print(f"[INFO] Animation activated and will remain active for ~{current_audio_duration:.2f} seconds")
             
             # Schedule animation to turn off after audio finishes
             reset_animation_after_delay(current_audio_duration)
 
         except Exception as e:
             print(f"[ERROR] Error processing trail.wav: {e}")
-            animation_active = False  # Ensure animation is off if there's an error
             return jsonify({"status": "error", "message": f"Failed to process audio: {e}"}), 500
     else:
         print("[ERROR] trail.wav not found")
         return jsonify({"status": "error", "message": "trail.wav not found in uploads/"}), 404
 
-    # Return complete response with audio and keyframes
-    response_data = {
+    return jsonify({
         "status": "success",
-        "message": "Processing completed successfully",
+        "message": "Transcription and audio response completed",
         "transcript": transcript,
-        "medical_response": response_text,
+        "llm_response": llm_response,
         "audio_file": "output/response.wav",
-        "keyframes_file": "output/response_keyframes.json" if keyframes_file else None,
         "start_animation": True,
-        "audio_duration": current_audio_duration
-    }
-    
-    return jsonify(response_data), 200
+        "audio_duration": current_audio_duration,
+        "keyframes_path": current_keyframes_path
+    }), 200
 
 @app.route('/', methods=['GET'])
 def home():
-    return "Dr. Sophia's Medical Assistant is running!"
+    return "Server is running!"
 
 @app.route('/start_animation', methods=['GET'])
 def start_animation():
-    global animation_active
+    global animation_active, current_keyframes_path
+    
+    # Convert to absolute path if we have a keyframes file
+    absolute_keyframes_path = os.path.abspath(current_keyframes_path) if current_keyframes_path else None
+    
+    # Get the current state but immediately reset it
+    current_state = animation_active
+    if animation_active:
+        animation_active = False
+        print("[DEBUG] Animation flag reset after query")
+    
+    # Return the animation state with absolute keyframes path
     response = {
-        "start_animation": animation_active
+        "start_animation": current_state,
+        "json_file_path": absolute_keyframes_path if current_state else None
     }
-    elapsed = time.time() - animation_start_time if animation_active else 0
-    print(f"[DEBUG] Animation status: {animation_active}, elapsed time: {elapsed:.2f}s")
+    
+    # Add some debug info
+    elapsed = time.time() - animation_start_time if current_state else 0
+    print(f"[DEBUG] Animation status returned: {current_state}, elapsed time: {elapsed:.2f}s")
+    print(f"[DEBUG] Current keyframes path: {absolute_keyframes_path}")
+    
     return jsonify(response)
 
 @app.route('/force_animation', methods=['GET'])
 def force_animation():
+    """Manually control animation state"""
     global animation_active
+    
     action = request.args.get('action', 'status')
     
     if action == 'start':
@@ -414,6 +450,25 @@ def force_animation():
     else:
         return jsonify({"status": "Current animation state", "start_animation": animation_active})
 
+@app.route('/reminders', methods=['GET'])
+def get_reminders():
+    """API endpoint to get all reminders"""
+    try:
+        with open(REMINDERS_FILE, 'r') as f:
+            reminders = json.load(f)
+        return jsonify({"status": "success", "reminders": reminders})
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Failed to load reminders: {e}"}), 500
+
+@app.route('/patient_history', methods=['GET'])
+def get_history():
+    """API endpoint to get patient history"""
+    try:
+        patient_history = get_patient_history()
+        return jsonify({"status": "success", "patient_history": patient_history})
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Failed to load patient history: {e}"}), 500
+
 if __name__ == '__main__':
-    print("[BOOT] Dr. Sophia's Medical Assistant running on port 5050")
+    print("[BOOT] Flask server running on port 5050")
     app.run(host='0.0.0.0', port=5050, debug=True)
